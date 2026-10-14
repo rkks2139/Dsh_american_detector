@@ -1,0 +1,9 @@
+# dsh-american-detector bundle layer.
+#
+# Mounts the host half (OS-level signals + the /api/american-detector/report
+# route the browser half reads). The browser half is discovered separately:
+# this same package declares dsh.client in package.json, so the client module
+# table composes lib/client.js into the Web boot graph on its own.
+- insert:
+    - id: american-detector
+      name: dsh-american-detector

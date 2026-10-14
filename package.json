@@ -1,0 +1,46 @@
+{
+  "name": "dsh-american-detector",
+  "version": "1.0.0",
+  "private": true,
+  "description": "检测你是不是美国用户：系统语言、时区、VPN、浏览器出品方、已装美国软件、美国 LLM、macOS/Windows、Docker 伪装……命中就弹出假的“您的账户已被封禁”（按任意键关闭）",
+  "type": "module",
+  "main": "src/host/index.js",
+  "exports": {
+    ".": "./src/host/index.js",
+    "./host": "./src/host/index.js",
+    "./client": "./lib/client.js",
+    "./src/*": "./src/*",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src/host/index.js",
+    "src/host/detect.js",
+    "src/client/index.js",
+    "src/client/browser-signals.js",
+    "src/client/verdict.js",
+    "src/client/overlay.js",
+    "lib/client.js",
+    "scripts/build-client.mjs",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build-client.mjs",
+    "test": "node scripts/test-client.mjs",
+    "report": "node -e \"import('./src/host/detect.js').then(async m => console.log(JSON.stringify(await m.detectHostReport(), null, 2)))\""
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "prank"
+  ],
+  "license": "MIT"
+}
