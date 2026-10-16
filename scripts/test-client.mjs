@@ -1,195 +1,284 @@
 #!/usr/bin/env node
 /**
- * Headless smoke test for the built client bundle.
+ * Headless smoke test for the fake ban dialog and its verdict memory.
  *
- * Stubs just enough of the browser (document, navigator, timers) and a
- * minimal Cordis-like ctx to materialize the factory, apply the plugin,
- * simulate a send, and assert the fake ban dialog appears and dismisses.
+ * The periodic login gate is disabled here (?dsh-gate=0) because
+ * scripts/test-gate.mjs owns it; these cases are about the American verdict,
+ * the rolling history latch, and any-key dismissal.
  *
  * Usage: node scripts/test-client.mjs
  */
-import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
+import { createHarness, materialize, Event } from './dom-harness.mjs'
+import { scoreSignals } from '../src/client/score.js'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
-const code = readFileSync(join(root, 'lib/client.js'), 'utf8')
+const bundle = join(root, 'lib/client.js')
 
-/* ------------------------------ DOM stub ------------------------------ */
-class ClassList {
-  constructor() { this.items = new Set() }
-  add(...names) { for (const name of names) this.items.add(name) }
-  remove(...names) { for (const name of names) this.items.delete(name) }
-  contains(name) { return this.items.has(name) }
-}
+const assert = (condition, message) => { if (!condition) throw new Error(message) }
 
-class Element {
-  constructor(tagName) {
-    this.tagName = String(tagName).toUpperCase()
-    this.children = []
-    this.attributes = {}
-    this.style = {}
-    this.dataset = {}
-    this.classList = new ClassList()
-    this._text = ''
-    this.innerHTML = ''
-    this.isContentEditable = false
-    this.value = ''
+/** Boot one page with the gate off, plus a session that can send instructions. */
+function page(options = {}) {
+  const harness = createHarness()
+  harness.document.documentElement.lang = options.pageLanguage ?? 'en'
+  harness.window.location.search = options.search ?? '?dsh-gate=0'
+  for (const [key, value] of Object.entries(options.storage ?? {})) harness.storage.set(key, value)
+  const context = vm.createContext(harness.sandbox)
+  const exportsObject = materialize(context, bundle, vm)
+
+  let submissions = []
+  let submissionListener = null
+  const session = {
+    getSnapshot: () => ({ pendingSubmissions: submissions.slice() }),
+    subscribe: (listener) => { submissionListener = listener; return () => { submissionListener = null } },
   }
-  get className() { return [...this.classList.items].join(' ') }
-  set className(value) { this.classList.items = new Set(String(value).split(/\s+/).filter(Boolean)) }
-  get textContent() { return this._text }
-  set textContent(value) { this._text = String(value) }
-  get innerText() { return this._text }
-  set innerText(value) { this._text = String(value) }
-  setAttribute(name, value) { this.attributes[name] = String(value) }
-  getAttribute(name) { return this.attributes[name] ?? null }
-  append(...nodes) { for (const node of nodes) this.children.push(node) }
-  appendChild(node) { this.children.push(node); return node }
-  remove() { this.removed = true }
-  addEventListener() {}
-  removeEventListener() {}
-  attachShadow() { this.shadowRoot = new Element('shadow-root'); return this.shadowRoot }
-  closest() { return null }
-  get offsetWidth() { return 100 }
-  blur() {}
+  const sessions = {
+    list: { getSnapshot: () => ({ ids: ['session-1'] }), subscribe: () => () => {} },
+    binding: () => ({ session }),
+  }
+  const ctx = {
+    logger: { info: () => {}, warn: () => {} },
+    get: name => (name === 'sessions' ? sessions : undefined),
+    effect: (fn) => { fn() },
+    slots: { inject: () => {}, register: () => () => {} },
+  }
+  exportsObject.apply(ctx)
+  harness.flushTimers()
+
+  return {
+    ...harness,
+    ctx,
+    exportsObject,
+    api: () => harness.window.__AMERICAN_DETECTOR__,
+    send(text = 'hi') {
+      submissions = [...submissions, { requestId: Math.random().toString(36).slice(2), time: Date.now(), text }]
+      submissionListener?.()
+      harness.flushTimers()
+    },
+    /** Re-apply onto a fresh session binding, as a new conversation would. */
+    reapply() {
+      submissions = []
+      submissionListener = null
+      exportsObject.apply(ctx)
+      harness.flushTimers()
+    },
+    banHost: () => harness.body.children.find(node => node.getAttribute('data-dsh-american-detector') === 'overlay'),
+    /** Press any key on the page. */
+    pressKey(key = 'x') {
+      let prevented = false
+      for (const handler of harness.listeners.get('keydown') ?? []) {
+        handler(new Event('keydown', { key, target: harness.body, preventDefault: () => { prevented = true } }))
+      }
+      return prevented
+    },
+  }
 }
 
-const html = new Element('html')
-html.lang = 'en-US'
-const body = new Element('body')
-const documentStub = {
-  documentElement: html,
-  body,
-  head: new Element('head'),
-  createElement: tag => new Element(tag),
-  querySelector: () => null,
-  activeElement: null,
-}
-const listeners = new Map()
-const windowStub = {
-  location: { search: '' },
-  setTimeout: (fn) => { fn(); return 0 },
-  clearTimeout: () => {},
-  addEventListener: (name, handler) => {
-    if (!listeners.has(name)) listeners.set(name, new Set())
-    listeners.get(name).add(handler)
-  },
-  removeEventListener: (name, handler) => { listeners.get(name)?.delete(handler) },
-}
+/* ------------------------------------------------------------------ *
+ * 1-4. An American browser raises the ban dialog on every send
+ * ------------------------------------------------------------------ */
+const p = page()
+const first = p.api().verdict()
+console.log('1. verdict:', JSON.stringify({ verdict: first.american, total: first.total, threshold: first.threshold, model: first.model }))
+assert(first.model === 'v2', `expected the v2 model, got ${first.model}`)
+assert(first.american === true, `en-US + US time zone + Chrome + English page must decide "American" (got ${first.total}/${first.threshold})`)
+assert(first.signals.some(signal => signal.id === 'browser-language' && signal.logit > 0), 'the browser language must be a positive term')
+assert(first.foldedCount > 0, 'co-firing signals must be folded, not counted twice')
 
-const sandbox = {
-  window: windowStub,
-  document: documentStub,
-  navigator: {
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
-    language: 'en-US',
-    languages: ['en-US', 'en'],
-    platform: 'MacIntel',
-    maxTouchPoints: 0,
-  },
-  Intl,
-  Date,
-  Math,
-  JSON,
-  console,
-  fetch: async () => ({ ok: true, json: async () => ({ signals: [] }) }),
-  setTimeout: windowStub.setTimeout,
-  clearTimeout: windowStub.clearTimeout,
-  Element,
-}
-sandbox.globalThis = sandbox
-windowStub.setTimeout = (fn) => { fn(); return 0 }
-windowStub.document = documentStub
+p.send('hello')
+const host = p.banHost()
+assert(host !== undefined, 'no ban overlay mounted after a send')
+const markup = host.allMarkup()
+assert(markup.includes('您的账户已被封禁'), 'dialog does not carry the ban headline')
+console.log('2. ban overlay mounted after a send; headline present')
 
-/* --------------------------- module loader --------------------------- */
-let registration = null
-sandbox.window.__ModuleLoader__ = { load: (value) => { registration = value } }
+// The scorecard is hidden by default: the first screen is the verdict alone.
+const card = () => host.shadowRoot.querySelector('.card')
+const detailsButton = () => card().querySelector('[data-details]')
+const detailsPane = () => card().querySelector('.details')
+assert(detailsButton() !== null, 'the dialog must offer a 判定依据 toggle')
+assert(detailsPane() !== null, 'the details pane must exist in the DOM')
+assert(!detailsPane().classList.contains('open'), 'the scorecard must be collapsed by default on the card')
+assert(markup.includes('查看判定依据'), 'the toggle must invite expanding the evidence')
+assert(host.allMarkup().includes('假的恶搞'), 'the prank disclaimer must be reachable')
+const button = detailsButton()
+button.dispatchEvent(new Event('click', { target: button }))
+assert(card().classList.contains('open'), 'clicking the toggle must open the scorecard')
+const openMarkup = detailsPane().descendantText()
+assert(openMarkup.includes('对数几率'), 'expanding must reveal the scorecard')
+assert(openMarkup.includes('正向证据'), 'the expanded pane must explain the row markers')
+console.log('   details: collapsed by default, expands on 查看判定依据')
 
-const context = vm.createContext(sandbox)
-vm.runInContext(code, context, { filename: 'lib/client.js' })
-
-if (registration === null) throw new Error('bundle never called __ModuleLoader__.load')
-if (registration.id !== 'dsh-american-detector') throw new Error(`wrong bundle id: ${registration.id}`)
-const exportsObject = registration.factory(() => { throw new Error('unexpected require') })
-if (typeof exportsObject.apply !== 'function') throw new Error('bundle exports no apply')
-
-/* ----------------------------- fake ctx ------------------------------ */
-const effects = []
-const fired = []
-const submissions = []
-let submissionListener = null
-const session = {
-  getSnapshot: () => ({ pendingSubmissions: submissions.slice() }),
-  subscribe: (listener) => { submissionListener = listener; return () => { submissionListener = null } },
-}
-const ctx = {
-  logger: { info: () => {}, warn: () => {} },
-  get: (name) => (name === 'sessions' ? sessionsService : undefined),
-  effect: (fn) => { effects.push(fn()) },
-  slots: { inject: () => {}, register: () => () => {} },
-}
-const sessionsService = {
-  list: { getSnapshot: () => ({ ids: ['session-1'] }), subscribe: () => () => {} },
-  binding: () => ({ session }),
-}
-
-exportsObject.apply(ctx)
-
-const report = () => ({
-  score: windowStub.__AMERICAN_DETECTOR__ ? windowStub.__AMERICAN_DETECTOR__.verdict().score : 'n/a',
-  american: windowStub.__AMERICAN_DETECTOR__.verdict().american,
-})
-
-/* ------------------------------- assert ------------------------------ */
-const overlayHost = () => body.children.find(node => node.getAttribute('data-dsh-american-detector') === 'overlay')
-
-console.log('1. verdict from browser signals:', JSON.stringify(report()))
-if (report().american !== true) throw new Error('en-US + America time zone + Chrome should decide "American"')
-
-// Simulate a send: a new pending submission echo appears.
-submissions.push({ requestId: 'r1', time: Date.now(), text: 'hello' })
-submissionListener?.()
-const host = overlayHost()
-if (host === undefined) throw new Error('no overlay mounted after a send')
-/** Collect every element in a (possibly shadow) subtree. */
-const allElements = (node, out = []) => {
-  out.push(node)
-  for (const child of node.children ?? []) allElements(child, out)
-  if (node.shadowRoot !== undefined && node.shadowRoot !== null) allElements(node.shadowRoot, out)
-  return out
-}
-const markup = allElements(host).map(node => node.innerHTML).join('\n')
-if (!markup.includes('您的账户已被封禁')) throw new Error('dialog does not carry the ban headline')
-if (!markup.includes('假的恶搞弹窗')) throw new Error('dialog is missing its prank disclaimer')
-console.log('2. overlay mounted after send; headline + disclaimer present')
-
-// Any key dismisses.
-const keydowns = listeners.get('keydown') ?? new Set()
-if (keydowns.size === 0) throw new Error('no keydown listeners registered')
-let prevented = false
-for (const handler of keydowns) handler({ key: 'x', preventDefault: () => { prevented = true }, stopPropagation: () => {}, stopImmediatePropagation: () => {}, target: body })
-if (!prevented) throw new Error('dismissal did not consume the key')
-if (host.style.display !== 'none') throw new Error('overlay did not hide on keypress')
+assert(p.pressKey('x') === true, 'dismissal did not consume the key')
+p.flushTimers() // the hide runs on a 150ms transition timer
+assert(host.style.display === 'none', 'overlay did not hide on keypress')
 console.log('3. any-key dismissal works; overlay hidden')
 
-// A second send re-opens it.
-submissions.push({ requestId: 'r2', time: Date.now(), text: 'again' })
-submissionListener?.()
-if (host.style.display === 'none') throw new Error('overlay did not re-open on the next send')
+p.send('again')
+assert(host.style.display !== 'none', 'overlay did not re-open on the next send')
 console.log('4. overlay re-opens on the next instruction')
 
-// A non-American setup must not fire.
-sandbox.navigator.language = 'zh-CN'
-sandbox.navigator.languages = ['zh-CN', 'zh']
-windowStub.__AMERICAN_DETECTOR__.hide()
-const before = windowStub.__AMERICAN_DETECTOR__.opens()
-submissions.push({ requestId: 'r3', time: Date.now(), text: 'third' })
-submissionListener?.()
-const after = windowStub.__AMERICAN_DETECTOR__.opens()
-console.log(`5. zh-CN user: verdict=${JSON.stringify(report())} opens ${before} -> ${after}`)
-if (report().american !== false) throw new Error('zh-CN should not be judged American without host signals')
-if (after !== before) throw new Error('overlay fired for a non-American user')
+/* ------------------------------------------------------------------ *
+ * 4b. The built-in keyword rule: typing 「test」 always bans
+ * ------------------------------------------------------------------ */
+{
+  // A zh-CN browser with an empty history would never be judged American, so
+  // anything that fires here is the keyword rule and nothing else.
+  const quiet = page({ pageLanguage: 'zh-CN' })
+  quiet.sandbox.navigator.language = 'zh-CN'
+  quiet.sandbox.navigator.languages = ['zh-CN', 'zh']
+  const api = quiet.api()
+  console.log(`4b. baseline: total=${api.verdict().total} american=${api.verdict().american}`)
+  assert(api.verdict().american === false, 'the baseline must not be American, or the test proves nothing')
+  console.log(`    matcher: ${JSON.stringify({ test: api.matchesKeyword('TEST！'), latest: api.matchesKeyword('latest'), tester: api.matchesKeyword('tester') })}`)
+  assert(api.matchesKeyword('test') === 'test', 'plain test must match')
+  assert(api.matchesKeyword('  TEST！') === 'test', 'case and trailing punctuation must be ignored')
+  assert(api.matchesKeyword('latest') === null, 'latest must not match')
+  assert(api.matchesKeyword('tester') === null, 'tester must not match')
+  assert(api.matchesKeyword('test the plugin') === null, 'a longer sentence must not match')
 
-console.log('\nall client smoke tests passed')
+  const beforeOpens = api.opens()
+  quiet.send('test')
+  assert(api.opens() === beforeOpens + 1, 'typing test must raise the ban dialog')
+  const overlay = quiet.banHost()
+  assert(overlay !== undefined, 'the ban overlay must be mounted')
+  const card = overlay.shadowRoot.querySelector('.card')
+  assert(card.allMarkup().includes('内置触发词'), 'the dialog must name the keyword rule as the reason')
+  assert(card.allMarkup().includes('关键词规则命中'), 'the dialog must flag the forced verdict')
+  const afterForced = api.verdict()
+  assert(afterForced.total < afterForced.threshold, `the evidence must stay non-American (got ${afterForced.total}/${afterForced.threshold})`)
+  assert(afterForced.latched === false, 'a keyword hit must NOT latch the alarm')
+  const memoryAfterForced = api.history()
+  assert(memoryAfterForced.americanCount === 0, `no American row may be recorded, got ${memoryAfterForced.americanCount}`)
+  assert(memoryAfterForced.forcedCount === 1, `the forced row must still be recorded for forensics, got ${memoryAfterForced.forcedCount}`)
+  console.log(`4c. 「test」 forced the dialog; evidence stayed at ${afterForced.total}/${afterForced.threshold}; alarm NOT latched (forced rows: ${memoryAfterForced.forcedCount})`)
+
+  // The keyword hit must leave no trace in the alarm: a normal instruction on
+  // the very same page has to stay quiet afterwards.
+  api.hide()
+  quiet.flushTimers()
+  const beforeNormal = api.opens()
+  quiet.send('优化一下这个函数')
+  assert(api.opens() === beforeNormal, 'a normal instruction must stay quiet after a keyword hit')
+  assert(api.matchesKeyword('优化一下这个函数') === null, 'a normal instruction must not match the rule')
+  console.log('4d. after a keyword hit the next normal instruction stays quiet (nothing latched)')
+
+  // ?dsh-keywords=0 turns the rule off.
+  const off = page({ search: '?dsh-gate=0&dsh-keywords=0', pageLanguage: 'zh-CN' })
+  off.sandbox.navigator.language = 'zh-CN'
+  off.sandbox.navigator.languages = ['zh-CN', 'zh']
+  const beforeOff = off.api().opens()
+  off.send('test')
+  assert(off.api().opens() === beforeOff, '?dsh-keywords=0 must disable the rule')
+  console.log('4e. ?dsh-keywords=0 disables the keyword rule')
+}
+
+/* ------------------------------------------------------------------ *
+ * 4f. Fifty keyword hits still leave the 50-row alarm empty
+ * ------------------------------------------------------------------ */
+{
+  const spam = page({ pageLanguage: 'zh-CN' })
+  spam.sandbox.navigator.language = 'zh-CN'
+  spam.sandbox.navigator.languages = ['zh-CN', 'zh']
+  const api = spam.api()
+  for (let index = 0; index < 55; index += 1) {
+    api.hide()
+    spam.flushTimers()
+    spam.send('test')
+  }
+  const memory = api.history()
+  const stored = JSON.parse(spam.storage.get('dsh-american-detector/history/v1'))
+  console.log(`4f. after 55 keyword hits: rows=${memory.count}/${api.historyLimit} american=${memory.americanCount} forced=${memory.forcedCount} latched=${api.verdict().latched}`)
+  assert(memory.count === api.historyLimit, `the window must stay at ${api.historyLimit}, got ${memory.count}`)
+  assert(memory.forcedCount === api.historyLimit, `every stored row must be a forced row, got ${memory.forcedCount}`)
+  assert(memory.americanCount === 0, `no keyword row may count as American, got ${memory.americanCount}`)
+  assert(api.verdict().latched === false, 'the alarm must stay off no matter how often the keyword fires')
+  assert(stored.every(row => row.american === false), 'every stored row must record american:false')
+  assert(stored.every(row => row.forced === true && row.keyword === 'test'), 'every stored row must keep its forced marker')
+
+  // The alarm is genuinely untouched: a normal instruction stays quiet.
+  api.hide()
+  spam.flushTimers()
+  const before = api.opens()
+  spam.send('正常指令')
+  assert(api.opens() === before, 'a normal instruction must stay quiet after 55 keyword hits')
+  console.log('    after 55 keyword hits a normal instruction is still quiet')
+}
+
+/* ------------------------------------------------------------------ *
+ * 5. The rolling history records one row per send
+ * ------------------------------------------------------------------ */
+const memory = p.api().history()
+console.log(`5. history: ${memory.count} rows, ${memory.americanCount} american, last=${memory.lastAmericanAt}`)
+assert(memory.count === 2, `history should hold 2 rows, holds ${memory.count}`)
+assert(typeof p.storage.get('dsh-american-detector/history/v1') === 'string', 'history was not persisted to storage')
+
+/* ------------------------------------------------------------------ *
+ * 6-7. The latch: an American row keeps the alarm on for a Chinese user
+ * ------------------------------------------------------------------ */
+p.sandbox.navigator.language = 'zh-CN'
+p.sandbox.navigator.languages = ['zh-CN', 'zh']
+p.api().hide()
+const beforeLatch = p.api().opens()
+p.send('zh-CN send')
+const latched = p.api().verdict()
+console.log(`6. zh-CN + history: total=${latched.total} raw=${latched.rawAmerican} american=${latched.american} latched=${latched.latched} opens ${beforeLatch} -> ${p.api().opens()}`)
+assert(latched.latched === true, 'an American row in history must latch the alarm')
+assert(p.api().opens() === beforeLatch + 1, 'the latched alarm must fire on the next instruction')
+assert(p.banHost().allMarkup().includes('历史警报'), 'the dialog does not explain the history latch on its first screen')
+
+p.api().clearHistory()
+const beforeClean = p.api().opens()
+p.send('clean send')
+const clean = p.api().verdict()
+console.log(`7. zh-CN + empty history: total=${clean.total} american=${clean.american} latched=${clean.latched} opens ${beforeClean} -> ${p.api().opens()}`)
+assert(clean.american === false, 'zh-CN with an empty history should not be American')
+assert(p.api().opens() === beforeClean, 'overlay fired for a non-American user')
+
+/* ------------------------------------------------------------------ *
+ * 8-9. ?dsh-ban=0 is the kill switch; export() is machine-readable
+ * ------------------------------------------------------------------ */
+const killed = page({
+  search: '?dsh-gate=0&dsh-ban=0',
+  storage: { 'dsh-american-detector/history/v1': JSON.stringify([{ at: Date.now(), american: true, score: 90 }]) },
+})
+console.log(`8. ?dsh-ban=0 with an American history row: american=${killed.api().verdict().american}`)
+assert(killed.api().verdict().american === false, '?dsh-ban=0 must override the history latch')
+assert(Number.isFinite(killed.api().verdict().total), 'the scorecard must still be readable')
+
+const exported = JSON.parse(killed.api().export())
+assert(Array.isArray(exported.history) && exported.gate !== undefined, 'export() must describe history and gate state')
+console.log('9. export() returns valid JSON with history + gate state')
+
+/* ------------------------------------------------------------------ *
+ * 10. A v2 scorer reading v1 host rows must not go blind
+ * ------------------------------------------------------------------ */
+{
+  const skew = page({
+    search: '?dsh-gate=0',
+    storage: { 'dsh-american-detector/history/v1': JSON.stringify([
+      { at: Date.now() - 86_400_000, american: true, score: 72 },              // v1 row
+      { at: Date.now(), model: 'v2', american: false, total: -2.9, threshold: 2.2 }, // v2 row
+    ]) },
+  })
+  const oldRows = [
+    { id: 'host-os', label: 'macOS', note: 'v1', weight: 8, value: 'darwin', hit: true },
+    { id: 'us-software', label: '美国公司出品的软件', note: 'v1', weight: 18, value: '7 个', hit: true },
+    { id: 'vpn', label: 'VPN / 代理', note: 'v1', weight: 16, value: 'utun0', hit: true },
+  ]
+  const scored = scoreSignals(oldRows, {})
+  console.log(`10. v1 host rows under the v2 model: total=${scored.total} rows=${scored.signals.length} american=${scored.american}`)
+  assert(scored.total > 0, 'v1 weighted rows must contribute, not score zero')
+  assert(scored.signals.every(signal => typeof signal.logit === 'number'), 'every row must carry a logit after normalization')
+  assert(scored.american === true, 'v1 evidence must still be able to decide')
+
+  // History replay: the v1 row keeps latching, the v2 row is read by its own scale.
+  const verdict = skew.api().verdict()
+  console.log(`    history: v1 row latches=${verdict.latched} alarmCount=${verdict.historyAlarm}`)
+  assert(verdict.latched === true, 'a v1 American row must keep the alarm latched')
+  assert(verdict.historyAlarm === 1, `only the v1 row counts as American, got ${verdict.historyAlarm}`)
+}
+
+console.log('\nall ban-dialog tests passed')
